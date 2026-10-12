@@ -25,45 +25,96 @@ def image_from_bytes(data, name):
     except Exception:
         return None
 
+
 def likely_image_url(u):
-    p=urlparse(u).path.lower()
-    return any(p.endswith('.'+ext) for ext in ('jpg','jpeg','png','webp','gif','avif')) or any(x in u.lower() for x in ('image','comic','chapter','upload'))
+    low = u.lower()
+    path = urlparse(u).path.lower()
+    extensions = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.bmp')
+    if not path.endswith(extensions) and not any(x in low for x in ('image', 'comic', 'chapter', 'upload', 'manga', 'manhua', 'pic', 'img')):
+        return False
+    if re.search(r'(^|[/_.-])(logo|icon|avatar|banner|advert|ads?)([/_.-]|$)', low):
+        return False
+    if re.search(r'(^|[/_.-])(thumb|thumbnail|preview|cover_small|small)([/_.-]|$)', low):
+        return False
+    if re.search(r'/(thumb|thumbnail|avatar|icons?)/', path):
+        return False
+    return True
+
 
 def extract_url_images(page_url, max_images=150):
-    headers={'User-Agent':'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36'}
-    resp=requests.get(page_url,headers=headers,timeout=20); resp.raise_for_status()
-    soup=BeautifulSoup(resp.text,'html.parser')
-    found=[]; seen=set()
-    for tag in soup.select('img, source'):
-        candidates=[]
-        for attr in ('data-src','data-original','data-lazy-src','data-url','src','data-ks-lazyload','data-cfsrc'):
-            val=tag.get(attr)
-            if val: candidates.append(val.strip())
-        srcset=tag.get('srcset') or tag.get('data-srcset')
-        if srcset:
-            for part in srcset.split(','):
-                u=part.strip().split(' ')[0]
-                if u: candidates.append(u)
-        for raw in candidates:
-            if raw.startswith('data:') or raw.startswith('blob:'): continue
-            u=urljoin(page_url,raw)
-            if u not in seen and likely_image_url(u):
-                seen.add(u); found.append(u); break
-        if len(found)>=max_images: break
-    # Keep page order; download candidates sequentially to reduce host pressure.
-    results=[]; errors=[]
-    for idx,u in enumerate(found,1):
-        try:
-            r=requests.get(u,headers={**headers,'Referer':page_url},timeout=15,stream=True)
-            r.raise_for_status()
-            ctype=r.headers.get('Content-Type','').lower()
-            if 'image' not in ctype and not urlparse(u).path.lower().endswith(('.jpg','.jpeg','.png','.webp','.gif','.avif')):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    }
+    resp = requests.get(page_url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    html = resp.text
+    soup = BeautifulSoup(html, 'html.parser')
+    found, seen = [], set()
+
+    def add_candidate(raw):
+        if not raw:
+            return
+        raw = str(raw).strip().strip("\"'")
+        raw = raw.replace("\\\\/", "/").replace("\\/", "/").replace("&amp;", "&")
+        if raw.startswith(("data:", "blob:", "javascript:")):
+            return
+        u = urljoin(page_url, raw)
+        if urlparse(u).scheme not in ("http", "https"):
+            return
+        if u not in seen and likely_image_url(u):
+            seen.add(u)
+            found.append(u)
+
+    attrs = (
+        'data-src', 'data-original', 'data-lazy-src', 'data-url', 'src',
+        'data-ks-lazyload', 'data-cfsrc', 'data-img', 'data-image',
+        'data-original-src', 'data-lazy', 'data-echo', 'data-actualsrc',
+        'data-srcset', 'srcset', 'data-href'
+    )
+    for tag in soup.select('img, source, [data-src], [data-original], [data-image]'):
+        for attr in attrs:
+            val = tag.get(attr)
+            if not val:
                 continue
-            content=r.content
-            if len(content)>25*1024*1024: continue
-            item=image_from_bytes(content,f'{idx:04d}_{urlparse(u).path.split("/")[-1][:70] or "image"}')
-            if item: results.append(item)
-        except Exception as e: errors.append(f'{u}: {e}')
+            if 'srcset' in attr:
+                for part in str(val).split(','):
+                    add_candidate(part.strip().split(' ')[0])
+            else:
+                add_candidate(val)
+
+    # Some readers place image URLs in inline scripts or JSON rather than img tags.
+    sources = [html] + [s.get_text(' ', strip=False) for s in soup.find_all('script')]
+    pattern = re.compile(r"(?:(?:https?:)?//[^\s<>]+|(?:/[A-Za-z0-9_./%?=&+-]+))\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:\?[^\s<>]*)?", re.I)
+    for source_text in sources:
+        normalized = source_text.replace("\\\\/", "/").replace("\\/", "/").replace("\\u002F", "/")
+        for match in pattern.findall(normalized):
+            add_candidate(match)
+
+    results, errors = [], []
+    for u in found:
+        if len(results) >= int(max_images):
+            break
+        try:
+            r = requests.get(u, headers={**headers, 'Referer': page_url}, timeout=20, stream=True)
+            r.raise_for_status()
+            ctype = r.headers.get('Content-Type', '').lower()
+            if 'image' not in ctype and not urlparse(u).path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.bmp')):
+                r.close()
+                continue
+            content = r.content
+            r.close()
+            if not content or len(content) > 25 * 1024 * 1024:
+                continue
+            item = image_from_bytes(content, f'{len(results)+1:04d}_{urlparse(u).path.split("/")[-1][:70] or "image"}')
+            if not item:
+                continue
+            width, height = item['image'].size
+            if width < 250 or height < 250 or width * height < 100_000:
+                continue
+            results.append(item)
+        except Exception as e:
+            errors.append(f'{u}: {e}')
     return results, errors, len(found)
 
 st.subheader('1. Extract images from a chapter URL')
