@@ -14,7 +14,7 @@ st.markdown('''<style>
 st.title('📚 Chapter Recap Maker — Mobile')
 st.caption('Extract chapter images, arrange them, stitch them, and save the result on your phone.')
 
-if 'items' not in st.session_state: st.session_state.items=[]
+if 'image_items' not in st.session_state: st.session_state.image_items=[]
 if 'notice' not in st.session_state: st.session_state.notice=''
 
 def image_from_bytes(data, name):
@@ -78,7 +78,7 @@ if st.button('🔗 Extract images from URL', type='primary'):
             try:
                 got, errs, candidate_count=extract_url_images(url,int(max_images))
                 if got:
-                    st.session_state.items=got
+                    st.session_state.image_items=got
                     st.success(f'Loaded {len(got)} images. Check their order below.')
                 else: st.warning('No downloadable images were found. The site may use JavaScript rendering, login, or anti-bot protection.')
                 if errs: st.info(f'{len(errs)} image(s) could not be downloaded. First error: {errs[0][:300]}')
@@ -93,15 +93,15 @@ if st.button('➕ Add uploaded images'):
         for f in files:
             item=image_from_bytes(f.getvalue(),f.name)
             if item: added.append(item)
-        st.session_state.items.extend(added)
+        st.session_state.image_items.extend(added)
         st.success(f'Added {len(added)} image(s).')
 
-st.subheader(f'3. Review and arrange images ({len(st.session_state.items)})')
-if st.session_state.items:
+st.subheader(f'3. Review and arrange images ({len(st.session_state.image_items)})')
+if st.session_state.image_items:
     st.caption('Images are stitched in the order shown. Use the arrows to correct the order or remove unwanted images.')
     if st.button('🗑️ Clear all images'):
-        st.session_state.items=[]; st.rerun()
-    for i,item in enumerate(st.session_state.items):
+        st.session_state.image_items=[]; st.rerun()
+    for i,item in enumerate(st.session_state.image_items):
         with st.container(border=True):
             a,b=st.columns([1,2])
             with a: st.image(item['image'],use_container_width=True)
@@ -110,20 +110,20 @@ if st.session_state.items:
                 c1,c2,c3=st.columns(3)
                 with c1:
                     if st.button('⬆️',key=f'up{i}',disabled=(i==0),help='Move up'):
-                        arr=st.session_state.items; arr[i-1],arr[i]=arr[i],arr[i-1]; st.rerun()
+                        arr=st.session_state.image_items; arr[i-1],arr[i]=arr[i],arr[i-1]; st.rerun()
                 with c2:
-                    if st.button('⬇️',key=f'down{i}',disabled=(i==len(st.session_state.items)-1),help='Move down'):
-                        arr=st.session_state.items; arr[i+1],arr[i]=arr[i],arr[i+1]; st.rerun()
+                    if st.button('⬇️',key=f'down{i}',disabled=(i==len(st.session_state.image_items)-1),help='Move down'):
+                        arr=st.session_state.image_items; arr[i+1],arr[i]=arr[i],arr[i+1]; st.rerun()
                 with c3:
                     if st.button('Remove',key=f'remove{i}'):
-                        st.session_state.items.pop(i); st.rerun()
+                        st.session_state.image_items.pop(i); st.rerun()
 
     st.subheader('4. Stitch and download')
     max_width=st.selectbox('Output width', ['Keep widest source width','1080 px','1440 px','Original widths'],index=0)
     gap=st.number_input('Space between images (pixels)',min_value=0,max_value=100,value=0)
     if st.button('🧩 Stitch images',type='primary'):
         try:
-            ims=[x['image'].copy() for x in st.session_state.items]
+            ims=[x['image'].copy() for x in st.session_state.image_items]
             if max_width!='Original widths':
                 target=max(ims[0].width,1) if max_width=='Keep widest source width' else int(max_width.split()[0])
                 scaled=[]
@@ -144,7 +144,7 @@ if st.session_state.items:
     if st.button('📦 Download all source images as ZIP'):
         zbuf=io.BytesIO()
         with zipfile.ZipFile(zbuf,'w',zipfile.ZIP_DEFLATED) as z:
-            for i,item in enumerate(st.session_state.items,1):
+            for i,item in enumerate(st.session_state.image_items,1):
                 ext='.png'; b=io.BytesIO(); item['image'].save(b,format='PNG')
                 safe=re.sub(r'[^A-Za-z0-9._-]+','_',item['name'])[:80]
                 z.writestr(f'{i:04d}_{safe}{ext}',b.getvalue())
