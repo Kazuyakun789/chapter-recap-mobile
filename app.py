@@ -2,6 +2,9 @@ import io, re, zipfile
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
 from PIL import Image, ImageOps
 import streamlit as st
 
@@ -29,93 +32,159 @@ def image_from_bytes(data, name):
 def likely_image_url(u):
     low = u.lower()
     path = urlparse(u).path.lower()
-    extensions = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.bmp')
-    if not path.endswith(extensions) and not any(x in low for x in ('image', 'comic', 'chapter', 'upload', 'manga', 'manhua', 'pic', 'img')):
+    if re.search(r'(^|[/_.-])(logo|icon|avatar|banner|advert|ads?|thumb|thumbnail|preview)([/_.-]|$)', low):
         return False
-    if re.search(r'(^|[/_.-])(logo|icon|avatar|banner|advert|ads?)([/_.-]|$)', low):
-        return False
-    if re.search(r'(^|[/_.-])(thumb|thumbnail|preview|cover_small|small)([/_.-]|$)', low):
-        return False
-    if re.search(r'/(thumb|thumbnail|avatar|icons?)/', path):
-        return False
-    return True
+    # URLs with image extensions are likely candidates; reader images can also have opaque URLs.
+    return path.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.bmp')) or any(
+        x in low for x in ('image', 'comic', 'chapter', 'upload', 'manga', 'manhua', 'pic', 'img')
+    )
+
+
+def browser_extract_url_images(page_url, max_images=150, scroll_limit=100):
+    """Use headless Chromium to trigger lazy-loaded chapter images while scrolling."""
+    options = Options()
+    options.add_argument('--headless=new')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--window-size=1440,1200')
+    options.add_argument('--lang=zh-CN')
+    options.page_load_strategy = 'eager'
+
+    chrome_candidates = ('/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome')
+    for candidate in chrome_candidates:
+        if __import__('os').path.exists(candidate):
+            options.binary_location = candidate
+            break
+
+    driver = None
+    errors = []
+    try:
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(45)
+        driver.get(page_url)
+        WebDriverWait(driver, 25).until(
+            lambda d: d.execute_script('return document.readyState') in ('interactive', 'complete')
+        )
+        # Give the reader time to initialize.
+        import time
+        time.sleep(3)
+
+        previous_height = 0
+        stable_rounds = 0
+        for _ in range(int(scroll_limit)):
+            height = driver.execute_script(
+                'return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)'
+            )
+            viewport = driver.execute_script('return window.innerHeight')
+            step = max(500, int(viewport * 0.75))
+            current_y = driver.execute_script('return window.scrollY')
+            next_y = min(current_y + step, max(0, height - viewport))
+            driver.execute_script('window.scrollTo(0, arguments[0]);', next_y)
+            time.sleep(0.7)
+            new_height = driver.execute_script(
+                'return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)'
+            )
+            if new_height == previous_height and next_y >= max(0, new_height - viewport):
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            previous_height = new_height
+            if stable_rounds >= 5:
+                break
+        # Some readers initialize images when scrolling back up too.
+        driver.execute_script('window.scrollTo(0, 0)')
+        time.sleep(1.5)
+
+        # Collect actual rendered image URLs in DOM order, plus dimensions for filtering.
+        dom_images = driver.execute_script("""
+            return Array.from(document.images).map((im, index) => ({
+                index: index,
+                src: im.currentSrc || im.src || im.getAttribute('data-src') ||
+                     im.getAttribute('data-original') || im.getAttribute('data-lazy-src') || '',
+                width: im.naturalWidth || im.width || 0,
+                height: im.naturalHeight || im.height || 0,
+                alt: im.alt || '',
+                cls: (typeof im.className === 'string' ? im.className : ''),
+                parent: (im.parentElement && (im.parentElement.className || im.parentElement.id)) || ''
+            }));
+        """)
+        resource_urls = driver.execute_script("""
+            return performance.getEntriesByType('resource')
+                .filter(e => e.initiatorType === 'img' || /\\.(jpg|jpeg|png|webp|gif|avif|bmp)(\\?|$)/i.test(e.name))
+                .map(e => e.name);
+        """)
+
+        candidates = []
+        seen = set()
+        for item in dom_images:
+            u = item.get('src', '')
+            if not u or u.startswith(('data:', 'blob:')):
+                continue
+            if int(item.get('width') or 0) < 250 or int(item.get('height') or 0) < 250:
+                continue
+            description = f"{item.get('alt','')} {item.get('cls','')} {item.get('parent','')} {u}".lower()
+            if re.search(r'logo|avatar|banner|advert|(^|[^a-z])ads?([^a-z]|$)|thumbnail|thumb|preview', description):
+                continue
+            if u not in seen:
+                seen.add(u)
+                candidates.append((u, item.get('width', 0), item.get('height', 0)))
+
+        # Resource entries can include reader images not represented by a currently visible img node.
+        for u in resource_urls:
+            u = u.replace('\\u0026', '&')
+            if not u.startswith(('http://', 'https://')) or u in seen or not likely_image_url(u):
+                continue
+            if re.search(r'logo|avatar|banner|advert|thumbnail|thumb|preview', u.lower()):
+                continue
+            seen.add(u)
+            candidates.append((u, 0, 0))
+
+        # Copy browser cookies to requests, which helps with sites that require a session.
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': driver.execute_script('return navigator.userAgent'),
+            'Referer': page_url,
+        })
+        for cookie in driver.get_cookies():
+            try:
+                session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain'))
+            except Exception:
+                pass
+
+        results = []
+        for u, dom_width, dom_height in candidates:
+            if len(results) >= int(max_images):
+                break
+            try:
+                response = session.get(u, timeout=20, stream=True)
+                response.raise_for_status()
+                content = response.content
+                response.close()
+                if not content or len(content) > 25 * 1024 * 1024:
+                    continue
+                item = image_from_bytes(content, f'{len(results)+1:04d}_{urlparse(u).path.split("/")[-1][:70] or "chapter_image"}')
+                if not item:
+                    continue
+                w, h = item['image'].size
+                if w < 250 or h < 250 or w * h < 100_000:
+                    continue
+                # If browser reported dimensions, use them to reject obvious small previews.
+                if dom_width and dom_height and (dom_width < 250 or dom_height < 250):
+                    continue
+                results.append(item)
+            except Exception as e:
+                errors.append(f'{u}: {e}')
+        return results, errors, len(candidates)
+    finally:
+        if driver is not None:
+            driver.quit()
 
 
 def extract_url_images(page_url, max_images=150):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    }
-    resp = requests.get(page_url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    html = resp.text
-    soup = BeautifulSoup(html, 'html.parser')
-    found, seen = [], set()
-
-    def add_candidate(raw):
-        if not raw:
-            return
-        raw = str(raw).strip().strip("\"'")
-        raw = raw.replace("\\\\/", "/").replace("\\/", "/").replace("&amp;", "&")
-        if raw.startswith(("data:", "blob:", "javascript:")):
-            return
-        u = urljoin(page_url, raw)
-        if urlparse(u).scheme not in ("http", "https"):
-            return
-        if u not in seen and likely_image_url(u):
-            seen.add(u)
-            found.append(u)
-
-    attrs = (
-        'data-src', 'data-original', 'data-lazy-src', 'data-url', 'src',
-        'data-ks-lazyload', 'data-cfsrc', 'data-img', 'data-image',
-        'data-original-src', 'data-lazy', 'data-echo', 'data-actualsrc',
-        'data-srcset', 'srcset', 'data-href'
-    )
-    for tag in soup.select('img, source, [data-src], [data-original], [data-image]'):
-        for attr in attrs:
-            val = tag.get(attr)
-            if not val:
-                continue
-            if 'srcset' in attr:
-                for part in str(val).split(','):
-                    add_candidate(part.strip().split(' ')[0])
-            else:
-                add_candidate(val)
-
-    # Some readers place image URLs in inline scripts or JSON rather than img tags.
-    sources = [html] + [s.get_text(' ', strip=False) for s in soup.find_all('script')]
-    pattern = re.compile(r"(?:(?:https?:)?//[^\s<>]+|(?:/[A-Za-z0-9_./%?=&+-]+))\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:\?[^\s<>]*)?", re.I)
-    for source_text in sources:
-        normalized = source_text.replace("\\\\/", "/").replace("\\/", "/").replace("\\u002F", "/")
-        for match in pattern.findall(normalized):
-            add_candidate(match)
-
-    results, errors = [], []
-    for u in found:
-        if len(results) >= int(max_images):
-            break
-        try:
-            r = requests.get(u, headers={**headers, 'Referer': page_url}, timeout=20, stream=True)
-            r.raise_for_status()
-            ctype = r.headers.get('Content-Type', '').lower()
-            if 'image' not in ctype and not urlparse(u).path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif', '.bmp')):
-                r.close()
-                continue
-            content = r.content
-            r.close()
-            if not content or len(content) > 25 * 1024 * 1024:
-                continue
-            item = image_from_bytes(content, f'{len(results)+1:04d}_{urlparse(u).path.split("/")[-1][:70] or "image"}')
-            if not item:
-                continue
-            width, height = item['image'].size
-            if width < 250 or height < 250 or width * height < 100_000:
-                continue
-            results.append(item)
-        except Exception as e:
-            errors.append(f'{u}: {e}')
-    return results, errors, len(found)
+    # Browser rendering is the primary path because the target reader lazy-loads images.
+    return browser_extract_url_images(page_url, max_images=max_images)
 
 st.subheader('1. Extract images from a chapter URL')
 url=st.text_input('Chapter page URL', placeholder='https://example.com/chapter/123')
@@ -125,15 +194,15 @@ with col2: st.write('Works best with publicly accessible pages whose image URLs 
 if st.button('🔗 Extract images from URL', type='primary'):
     if not url.startswith(('http://','https://')): st.error('Enter a complete URL beginning with http:// or https://.')
     else:
-        with st.spinner('Loading page and downloading images…'):
+        with st.spinner('Opening the chapter in a browser and scrolling to load comic pages…'):
             try:
                 got, errs, candidate_count=extract_url_images(url,int(max_images))
                 if got:
                     st.session_state.image_items=got
                     st.success(f'Loaded {len(got)} images. Check their order below.')
-                else: st.warning('No downloadable images were found. The site may use JavaScript rendering, login, or anti-bot protection.')
+                else: st.warning('No comic-page images were found. The site may require login, use protected/encoded images, or block automated browsers.')
                 if errs: st.info(f'{len(errs)} image(s) could not be downloaded. First error: {errs[0][:300]}')
-            except Exception as e: st.error(f'Could not extract images: {e}')
+            except Exception as e: st.error(f'Could not extract images: {e}. Check that Chromium and its driver are installed in the hosting environment.')
 
 st.subheader('2. Upload images from your phone')
 files=st.file_uploader('Choose multiple image files',type=['png','jpg','jpeg','webp','bmp','gif'],accept_multiple_files=True)

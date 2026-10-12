@@ -1,4 +1,5 @@
-streamlit>=1.36,<2.0
-requests>=2.31
-beautifulsoup4>=4.12
-Pillow>=10.0
+streamlit
+requests
+beautifulsoup4
+pillow
+selenium>=4.20,<5
